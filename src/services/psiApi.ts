@@ -5,34 +5,27 @@
 
 import { AirQualitySnapshot, HourlyHistoricalRecord, RegionKey, RegionReadings } from '../types/psi';
 
-const PSI_API_URL = 'https://api.data.gov.sg/v1/environment/psi';
-const PM25_API_URL = 'https://api.data.gov.sg/v1/environment/pm25';
+const SERVERLESS_PSI_ENDPOINT = '/api/psi';
+const FALLBACK_DIRECT_V2_URL = 'https://api-open.data.gov.sg/v2/real-time/api/psi';
 
-interface DataGovPsiItem {
-  timestamp: string;
-  update_timestamp: string;
-  readings: {
-    psi_twenty_four_hourly?: Record<string, number>;
-    pm25_twenty_four_hourly?: Record<string, number>;
-    pm25_sub_index?: Record<string, number>;
-    pm10_twenty_four_hourly?: Record<string, number>;
-    pm10_sub_index?: Record<string, number>;
-    o3_eight_hour_max?: Record<string, number>;
-    o3_sub_index?: Record<string, number>;
-    no2_one_hour_max?: Record<string, number>;
-    so2_twenty_four_hourly?: Record<string, number>;
-    so2_sub_index?: Record<string, number>;
-    co_eight_hour_max?: Record<string, number>;
-    co_sub_index?: Record<string, number>;
+interface DataGovV2Payload {
+  code?: number;
+  data?: {
+    regionMetadata?: Array<{ name: string; labelLocation: { latitude: number; longitude: number } }>;
+    items?: Array<{
+      date?: string;
+      updatedTimestamp?: string;
+      update_timestamp?: string;
+      timestamp?: string;
+      readings: Record<string, Record<string, number>>;
+    }>;
   };
-}
-
-interface DataGovPm25Item {
-  timestamp: string;
-  update_timestamp: string;
-  readings: {
-    pm25_one_hourly?: Record<string, number>;
-  };
+  items?: Array<{
+    timestamp?: string;
+    updatedTimestamp?: string;
+    update_timestamp?: string;
+    readings: Record<string, Record<string, number>>;
+  }>;
 }
 
 export type SimulationScenario = 'live' | 'moderate' | 'unhealthy_spike' | 'severe_crisis' | 'pristine';
@@ -52,52 +45,57 @@ export async function fetchLiveAirQuality(scenario: SimulationScenario = 'live')
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const [psiRes, pm25Res] = await Promise.all([
-      fetch(PSI_API_URL, { signal: controller.signal }),
-      fetch(PM25_API_URL, { signal: controller.signal }).catch(() => null)
-    ]);
+    // Attempt to fetch from local serverless endpoint /api/psi, fallback to direct v2 endpoint
+    let res = await fetch(SERVERLESS_PSI_ENDPOINT, { signal: controller.signal }).catch(() => null);
+    if (!res || !res.ok) {
+      res = await fetch(FALLBACK_DIRECT_V2_URL, { signal: controller.signal });
+    }
 
     clearTimeout(timeoutId);
 
-    if (!psiRes.ok) {
-      throw new Error(`Data.gov.sg PSI responded with status ${psiRes.status}`);
+    if (!res.ok) {
+      throw new Error(`PSI endpoint responded with status ${res.status}`);
     }
 
-    const psiData = await psiRes.json();
-    let pm25OneHourlyData: Record<string, number> = {};
+    const payload: DataGovV2Payload = await res.json();
 
-    if (pm25Res && pm25Res.ok) {
-      try {
-        const pm25Json = await pm25Res.json();
-        const latestPm25Item: DataGovPm25Item = pm25Json.items?.[pm25Json.items.length - 1];
-        if (latestPm25Item?.readings?.pm25_one_hourly) {
-          pm25OneHourlyData = latestPm25Item.readings.pm25_one_hourly;
-        }
-      } catch {
-        // Fallback silently if PM25 endpoint structure differs
-      }
-    }
-
-    const latestPsiItem: DataGovPsiItem = psiData.items?.[psiData.items.length - 1];
-    if (!latestPsiItem || !latestPsiItem.readings) {
+    // Extract item from v2 format (payload.data.items) or v1 format (payload.items)
+    const latestItem = payload.data?.items?.[payload.data.items.length - 1] || payload.items?.[payload.items.length - 1];
+    if (!latestItem || !latestItem.readings) {
       throw new Error('Invalid items payload in PSI API');
     }
 
-    const readings = latestPsiItem.readings;
-    const regionKeys: RegionKey[] = ['north', 'south', 'east', 'west', 'central', 'national'];
+    const readings = latestItem.readings;
+    const regionKeys: RegionKey[] = ['north', 'south', 'east', 'west', 'central'];
     const parsedReadings: Partial<Record<RegionKey, RegionReadings>> = {};
+
+    let maxPsi = 0;
+    let maxPm25 = 0;
+    let maxPm10 = 0;
+    let maxO3 = 0;
+    let maxNo2 = 0;
+    let maxSo2 = 0;
+    let maxCo = 0;
 
     for (const key of regionKeys) {
       const psi24 = readings.psi_twenty_four_hourly?.[key] ?? 45;
-      const pm25_24 = readings.pm25_twenty_four_hourly?.[key] ?? 14;
-      const pm25_1h = pm25OneHourlyData[key] ?? Math.round(pm25_24 * 1.1) ?? 16;
+      const pm25_24 = readings.pm25_twenty_four_hourly?.[key] ?? Math.round(psi24 * 0.75);
+      const pm25_1h = readings.pm25_one_hourly?.[key] ?? Math.round(pm25_24 * 1.05);
       const pm10_24 = readings.pm10_twenty_four_hourly?.[key] ?? 28;
-      const o3 = readings.o3_eight_hour_max?.[key] ?? 24;
+      const o3 = readings.o3_eight_hour_max?.[key] ?? 20;
       const no2 = readings.no2_one_hour_max?.[key] ?? 22;
       const so2 = readings.so2_twenty_four_hourly?.[key] ?? 6;
-      const co = readings.co_eight_hour_max?.[key] ?? 0.6;
+      const co = readings.co_eight_hour_max?.[key] ?? 1;
+
+      if (psi24 > maxPsi) maxPsi = psi24;
+      if (pm25_1h > maxPm25) maxPm25 = pm25_1h;
+      if (pm10_24 > maxPm10) maxPm10 = pm10_24;
+      if (o3 > maxO3) maxO3 = o3;
+      if (no2 > maxNo2) maxNo2 = no2;
+      if (so2 > maxSo2) maxSo2 = so2;
+      if (co > maxCo) maxCo = co;
 
       parsedReadings[key] = {
         psi24h: psi24,
@@ -111,9 +109,21 @@ export async function fetchLiveAirQuality(scenario: SimulationScenario = 'live')
       };
     }
 
+    // Set island-wide national reading as maximum across regions (or explicit national reading if provided)
+    parsedReadings.national = {
+      psi24h: readings.psi_twenty_four_hourly?.national ?? maxPsi,
+      pm25OneHourly: readings.pm25_one_hourly?.national ?? maxPm25,
+      pm25_24h: readings.pm25_twenty_four_hourly?.national ?? maxPm25,
+      pm10_24h: readings.pm10_twenty_four_hourly?.national ?? maxPm10,
+      o3_8h: readings.o3_eight_hour_max?.national ?? maxO3,
+      no2_1h: readings.no2_one_hour_max?.national ?? maxNo2,
+      so2_24h: readings.so2_twenty_four_hourly?.national ?? maxSo2,
+      co_8h: readings.co_eight_hour_max?.national ?? maxCo
+    };
+
     const snapshot: AirQualitySnapshot = {
-      timestamp: latestPsiItem.timestamp || new Date().toISOString(),
-      updateTimestamp: latestPsiItem.update_timestamp || new Date().toISOString(),
+      timestamp: latestItem.timestamp || latestItem.updatedTimestamp || new Date().toISOString(),
+      updateTimestamp: latestItem.updatedTimestamp || latestItem.timestamp || new Date().toISOString(),
       readings: parsedReadings as Record<RegionKey, RegionReadings>,
       wind: {
         direction: 'SSW',
