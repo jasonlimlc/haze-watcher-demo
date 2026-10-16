@@ -1,0 +1,6 @@
+{
+  "name": "AirGuard SG - Live Singapore PSI & Air Quality Alerts",
+  "description": "Real-time Singapore PSI air quality tracker, interactive regional map, health advisories, and push notifications when haze reaches unhealthy thresholds.",
+  "requestFramePermissions": ["geolocation", "notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
